@@ -6,6 +6,11 @@ name: Gerar APK (Godot)
 
 on:
   workflow_dispatch:
+    inputs:
+      usar_blender:
+        description: "Usar o Blender (iluminação e acabamento)? Desmarque para um build mais rápido"
+        type: boolean
+        default: true
   push:
     paths:
       - "**.zip"
@@ -61,6 +66,7 @@ jobs:
           ls projeto_final/map | head
 
       - name: Blender (opcional) - chanfro e acabamento nas casas dos condomínios
+        if: ${{ inputs.usar_blender != false }}
         continue-on-error: true
         run: |
           SCRIPT=$(find work -name enhance_houses.py | head -n 1)
@@ -85,6 +91,19 @@ jobs:
             out="${raw%_raw.obj}.obj"
             python "$BAKE" "$raw" "$out" 1.4 0.25
           done
+
+      - name: Blender (opcional) - iluminação global da cidade com Cycles
+        if: ${{ inputs.usar_blender != false }}
+        continue-on-error: true
+        timeout-minutes: 50
+        run: |
+          SCRIPT=$(find work -name bake_city_gi.py | head -n 1)
+          if [ -z "$SCRIPT" ] || [ ! -d projeto_final/city ]; then
+            echo "Sem script do Blender ou sem cidade, pulando"
+            exit 0
+          fi
+          which blender || (sudo apt-get update -qq && sudo apt-get install -y -qq blender)
+          blender -b -noaudio -P "$SCRIPT" -- projeto_final/city
 
       - uses: actions/upload-artifact@v4
         with:
