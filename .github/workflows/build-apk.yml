@@ -1,0 +1,160 @@
+# Coloque este arquivo em .github/workflows/build-apk.yml (FORA do zip).
+# Ele procura qualquer .zip no repositório, extrai, acha o projeto Godot,
+# reconverte o mapa se encontrar o rp_downtown_vv1.bsp e exporta o APK.
+
+name: Gerar APK (Godot)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "**.zip"
+
+jobs:
+  extrair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pillow
+
+      - name: Extrair todos os .zip do repositório
+        run: |
+          mkdir -p work
+          ZIPS=$(find . -name '*.zip' -not -path './.git/*' -not -path './work/*')
+          if [ -z "$ZIPS" ]; then
+            echo "::error::Nenhum .zip encontrado no repositório"
+            exit 1
+          fi
+          for z in $ZIPS; do
+            echo "Extraindo $z"
+            unzip -oq "$z" -d work
+          done
+          find work -maxdepth 3 | head -n 40
+
+      - name: Localizar o projeto Godot
+        run: |
+          GODOT_FILE=$(find work -name project.godot | head -n 1)
+          if [ -z "$GODOT_FILE" ]; then
+            echo "::error::project.godot não encontrado dentro dos zips"
+            exit 1
+          fi
+          PROJ=$(dirname "$GODOT_FILE")
+          echo "Projeto em: $PROJ"
+          cp -r "$PROJ" projeto_final
+          mkdir -p projeto_final/map
+
+      - name: Reconverter o mapa (se o .bsp estiver em algum zip)
+        run: |
+          BSP=$(find work -iname 'rp_downtown_vv1.bsp' | head -n 1)
+          CONV=$(find work -name bsp2obj.py | head -n 1)
+          if [ -n "$BSP" ] && [ -n "$CONV" ]; then
+            echo "Convertendo $BSP"
+            python "$CONV" "$BSP" projeto_final/map
+          else
+            echo "Sem .bsp (ou sem bsp2obj.py): usando o mapa já convertido no projeto"
+          fi
+          ls projeto_final/map | head
+
+      - name: Blender (opcional) - chanfro e acabamento nas casas dos condomínios
+        continue-on-error: true
+        run: |
+          SCRIPT=$(find work -name enhance_houses.py | head -n 1)
+          if [ -z "$SCRIPT" ] || [ ! -d projeto_final/condos ]; then
+            echo "Sem script do Blender ou sem condomínios, pulando"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq blender
+          blender -b -noaudio -P "$SCRIPT" -- projeto_final/condos
+
+      - name: Gravar sombreamento nas casas (opcional)
+        continue-on-error: true
+        run: |
+          BAKE=$(find work -name bake_ao.py | head -n 1)
+          if [ -z "$BAKE" ] || [ ! -d projeto_final/condos ]; then
+            echo "Sem bake_ao.py ou sem condomínios, pulando"
+            exit 0
+          fi
+          pip install numpy
+          for raw in projeto_final/condos/*_raw.obj; do
+            out="${raw%_raw.obj}.obj"
+            python "$BAKE" "$raw" "$out" 1.4 0.25
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: projeto
+          path: projeto_final
+
+  apk:
+    needs: extrair
+    runs-on: ubuntu-latest
+    container: barichello/godot-ci:4.3
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: projeto
+          path: projeto_final
+
+      - name: Preparar Godot e Android
+        run: |
+          echo "HOME=$HOME  GODOT_VERSION='$GODOT_VERSION'"
+          echo "--- procurando templates, SDK e Java ---"
+          find / -maxdepth 6 -type d -name export_templates 2>/dev/null || true
+          ls -d /usr/lib/android-sdk /usr/lib/jvm/* 2>/dev/null || true
+          echo "ANDROID_HOME='$ANDROID_HOME' ANDROID_SDK_ROOT='$ANDROID_SDK_ROOT'"
+
+          # templates de exportação (não depende da variável GODOT_VERSION)
+          SRC=$(ls -d /root/.local/share/godot/export_templates/*/ 2>/dev/null | head -n 1)
+          if [ -z "$SRC" ]; then
+            echo "::error::Templates de exportação não encontrados (veja a lista acima)"
+            exit 1
+          fi
+          NAME=$(basename "$SRC")
+          mkdir -p ~/.local/share/godot/export_templates ~/.config/godot
+          cp -r "$SRC" ~/.local/share/godot/export_templates/"$NAME"
+          echo "Templates copiados: $NAME"
+
+          # SDK do Android e Java
+          SDK=/usr/lib/android-sdk
+          if [ ! -d "$SDK" ]; then SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"; fi
+          JAVA=$(ls -d /usr/lib/jvm/*/ 2>/dev/null | head -n 1)
+          JAVA=${JAVA%/}
+          echo "SDK=$SDK  JAVA=$JAVA"
+
+          # chave de debug
+          keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+            -keystore ~/debug.keystore -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+
+          # configurações do editor (escritas direto, sem precisar abrir o Godot antes)
+          for F in editor_settings-4.tres editor_settings-4.3.tres; do
+            {
+              echo '[gd_resource type="EditorSettings" format=3]'
+              echo ''
+              echo '[resource]'
+              echo "export/android/android_sdk_path = \"$SDK\""
+              echo "export/android/java_sdk_path = \"$JAVA\""
+              echo "export/android/debug_keystore = \"$HOME/debug.keystore\""
+              echo 'export/android/debug_keystore_user = "androiddebugkey"'
+              echo 'export/android/debug_keystore_pass = "android"'
+            } > ~/.config/godot/$F
+          done
+
+      - name: Importar recursos e exportar APK
+        run: |
+          mkdir -p build
+          cd projeto_final
+          godot --headless --import
+          godot --headless --export-debug "Android" ../build/jogo.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jogo-apk
+          path: build/jogo.apk
+          
