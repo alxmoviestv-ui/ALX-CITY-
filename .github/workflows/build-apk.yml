@@ -1,387 +1,174 @@
 # Coloque este arquivo em .github/workflows/build-apk.yml (FORA do zip).
-#
-# O que ele faz:
-#   1. Acha o projeto Godot (solto no repositório ou dentro do .zip mais recente).
-#   2. Reconverte o mapa se o rp_downtown_vv1.bsp estiver no repositório.
-#   3. Blender (OBRIGATÓRIO): chanfro nas casas + iluminação global (Cycles) na cidade.
-#      Se qualquer etapa do Blender falhar ou não processar tudo, o build inteiro falha.
-#   4. Exporta o APK (debug, arm64) com Godot, Android SDK e JDK 17.
-#
-# Versões padrão (mudam em "Run workflow" sem editar o arquivo):
-#   Godot 4.7.2 | Blender 5.2.3 LTS | Android build-tools 35.0.1 / platform 35
-# Se o jogo quebrar no Godot novo, rode com 4.3. Se um script do Blender falhar
-# no Blender novo, rode com 4.2.22.
+# Ele procura qualquer .zip no repositório, extrai, acha o projeto Godot e então:
+#   1) Blender (obrigatório): cria o personagem e o carro, melhora as casas e calcula a iluminação da cidade;
+#   2) Godot (obrigatório): importa tudo e exporta o APK.
+# Se qualquer etapa do Blender falhar, o build para com o erro no log (mande o texto para corrigir).
+# Pode levar horas; em repositório público não há limite de minutos.
 
-name: Gerar APK (Godot + Blender)
+name: Gerar APK (Blender + Godot)
 
 on:
   workflow_dispatch:
-    inputs:
-      godot_version:
-        description: "Versão do Godot (ex.: 4.7.2). Se o jogo quebrar, volte para 4.3"
-        type: string
-        default: "4.7.2"
-      blender_version:
-        description: "Versão do Blender (ex.: 5.2.3). Se um script falhar, tente 4.2.22"
-        type: string
-        default: "5.2.3"
-      amostras_cycles:
-        description: "Qualidade da iluminação global (amostras do Cycles). Mais = melhor e mais lento"
-        type: string
-        default: "32"
   push:
     paths:
       - "**.zip"
-      - "game/**"
-      - "tools/**"
-      - ".github/workflows/build-apk.yml"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: build-apk-${{ github.ref }}
-  cancel-in-progress: true
-
-defaults:
-  run:
-    shell: bash
-
-env:
-  GODOT_VERSION: ${{ inputs.godot_version || '4.7.2' }}
-  BLENDER_VERSION: ${{ inputs.blender_version || '5.2.3' }}
-  CYCLES_SAMPLES: ${{ inputs.amostras_cycles || '32' }}
-  ANDROID_BUILD_TOOLS: "35.0.1"
-  ANDROID_PLATFORM: "android-35"
-  ANDROID_CMAKE: "3.10.2.4988404"
-  ANDROID_NDK: "28.1.13356709"
 
 jobs:
-  # ------------------------------------------------------------------
-  # 1) Prepara o projeto e passa pelo Blender (obrigatório)
-  # ------------------------------------------------------------------
-  preparar:
+  extrair:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Instalar dependências Python
-        run: pip install numpy pillow
+      - run: pip install pillow numpy
 
-      - name: Validar as versões pedidas
-        run: |
-          for v in "$GODOT_VERSION" "$BLENDER_VERSION"; do
-            case "$v" in
-              ''|*[!0-9.]*) echo "::error::Versão inválida: '$v' (use só números e pontos, ex.: 4.7.2)"; exit 1;;
-            esac
-          done
-          case "$CYCLES_SAMPLES" in
-            ''|*[!0-9]*) echo "::error::amostras_cycles tem de ser um número inteiro"; exit 1;;
-          esac
-          echo "Godot $GODOT_VERSION | Blender $BLENDER_VERSION | Cycles $CYCLES_SAMPLES amostras"
-
-      - name: Localizar o projeto (solto ou dentro do .zip mais recente)
+      - name: Extrair todos os .zip do repositório
         run: |
           mkdir -p work
-          excluir=(-not -path './.git/*' -not -path './work/*')
-
-          LOOSE=$(find . -name project.godot "${excluir[@]}" | head -n 1 || true)
-          if [ -n "$LOOSE" ]; then
-            echo "Projeto solto no repositório: $LOOSE"
-            SEARCH_ROOT="."
-          else
-            BEST=""; BEST_TS=0
-            while IFS= read -r z; do
-              if unzip -Z1 "$z" | grep -E '(^|/)project\.godot$' >/dev/null; then
-                ts=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
-                ts=${ts:-0}
-                echo "Candidato: $z (commit $ts)"
-                if [ -z "$BEST" ] || [ "$ts" -gt "$BEST_TS" ]; then BEST="$z"; BEST_TS="$ts"; fi
-              fi
-            done < <(find . -name '*.zip' "${excluir[@]}")
-            if [ -z "$BEST" ]; then
-              echo "::error::Nenhum .zip com project.godot encontrado no repositório"
-              exit 1
-            fi
-            echo "Usando o zip: $BEST"
-            mkdir -p work/src
-            unzip -oq "$BEST" -d work/src
-            SEARCH_ROOT="work/src"
+          ZIPS=$(find . -name '*.zip' -not -path './.git/*' -not -path './work/*')
+          if [ -z "$ZIPS" ]; then
+            echo "::error::Nenhum .zip encontrado no repositório"
+            exit 1
           fi
-
-          find_one() {
-            find "$SEARCH_ROOT" -name "$1" -not -path '*/.git/*' -not -path './work/*' | head -n 1 || true
-          }
-
-          GODOT_FILE=$(find_one project.godot)
-          PROJ_DIR=$(dirname "$GODOT_FILE")
-          echo "Projeto Godot em: $PROJ_DIR"
-
-          ENHANCE_HOUSES=$(find_one enhance_houses.py)
-          BAKE_CITY_GI=$(find_one bake_city_gi.py)
-          BAKE_AO=$(find_one bake_ao.py)
-          BAKE_CITY=$(find_one bake_city.py)
-          BSP2OBJ=$(find_one bsp2obj.py)
-
-          for pair in "enhance_houses.py:$ENHANCE_HOUSES" "bake_city_gi.py:$BAKE_CITY_GI" \
-                      "bake_ao.py:$BAKE_AO" "bake_city.py:$BAKE_CITY"; do
-            if [ -z "${pair#*:}" ]; then
-              echo "::error::Script obrigatório não encontrado: ${pair%%:*}"
-              exit 1
-            fi
+          for z in $ZIPS; do
+            echo "Extraindo $z"
+            unzip -oq "$z" -d work
           done
+          find work -maxdepth 3 | head -n 40
 
-          {
-            echo "SEARCH_ROOT=$SEARCH_ROOT"
-            echo "PROJ_DIR=$PROJ_DIR"
-            echo "ENHANCE_HOUSES=$ENHANCE_HOUSES"
-            echo "BAKE_CITY_GI=$BAKE_CITY_GI"
-            echo "BAKE_AO=$BAKE_AO"
-            echo "BAKE_CITY=$BAKE_CITY"
-            echo "BSP2OBJ=$BSP2OBJ"
-          } >> "$GITHUB_ENV"
-
-          mkdir -p projeto_final
-          rsync -a --exclude='.git/' --exclude='/work/' --exclude='/projeto_final/' "$PROJ_DIR"/ projeto_final/
-          mkdir -p projeto_final/map
-          ls projeto_final | head -n 30
-
-      - name: Reconverter o mapa (se o .bsp estiver no repositório)
+      - name: Localizar o projeto Godot
         run: |
-          BSP=$(find "$SEARCH_ROOT" -iname 'rp_downtown_vv1.bsp' -not -path '*/.git/*' | head -n 1 || true)
-          if [ -n "$BSP" ] && [ -n "$BSP2OBJ" ]; then
-            echo "Convertendo $BSP"
-            python "$BSP2OBJ" "$BSP" projeto_final/map
-            echo "MAP_RECONVERTIDO=1" >> "$GITHUB_ENV"
-          else
-            echo "Sem .bsp (ou sem bsp2obj.py): usando o mapa já convertido no projeto"
+          GODOT_FILE=$(find work -name project.godot | head -n 1)
+          if [ -z "$GODOT_FILE" ]; then
+            echo "::error::project.godot não encontrado dentro dos zips"
+            exit 1
           fi
-          test -f projeto_final/map/rp_downtown_vv1.obj
+          PROJ=$(dirname "$GODOT_FILE")
+          echo "Projeto em: $PROJ"
+          cp -r "$PROJ" projeto_final
+          mkdir -p projeto_final/assets
 
-      - name: Sombreamento do mapa original (só se reconverteu ou se faltar)
-        run: |
-          if [ "${MAP_RECONVERTIDO:-0}" = "1" ] || [ ! -f projeto_final/map/rp_downtown_vv1_shaded.obj ]; then
-            python "$BAKE_AO" projeto_final/map/rp_downtown_vv1.obj projeto_final/map/rp_downtown_vv1_shaded.obj 2.0
-          else
-            echo "Mapa sombreado já existe, mantendo"
-          fi
-
-      # ---------------- Blender (obrigatório) ----------------
-      - name: Cache do Blender
-        id: cache-blender
-        uses: actions/cache@v6
-        with:
-          path: ~/blender
-          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
-
-      - name: Baixar o Blender ${{ env.BLENDER_VERSION }}
-        if: steps.cache-blender.outputs.cache-hit != 'true'
-        run: |
-          SERIES="${BLENDER_VERSION%.*}"
-          URL="https://download.blender.org/release/Blender${SERIES}/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
-          echo "Baixando $URL"
-          mkdir -p "$HOME/blender"
-          curl -fL --retry 5 --retry-delay 5 "$URL" -o /tmp/blender.tar.xz
-          tar -xf /tmp/blender.tar.xz -C "$HOME/blender" --strip-components=1
-
-      - name: Bibliotecas do Blender e teste
+      - name: Instalar o Blender
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libsm6 libxkbcommon0 libegl1
-          "$HOME/blender/blender" -b --factory-startup -noaudio --version
+          sudo apt-get install -y -qq blender
+          blender --version | head -n 1
 
-      - name: Blender - chanfro e acabamento nas casas dos condomínios
+      - name: Blender - criar o personagem (esqueleto e animações)
         run: |
-          test -d projeto_final/condos || { echo "::error::Pasta condos não existe no projeto"; exit 1; }
-          "$HOME/blender/blender" -b --factory-startup -noaudio --python-exit-code 1 \
-            -P "$ENHANCE_HOUSES" -- projeto_final/condos 2>&1 | tee /tmp/casas.log
-          RES=$(grep -E 'casas melhoradas: [0-9]+ de [0-9]+' /tmp/casas.log | tail -n 1 || true)
-          if [ -z "$RES" ]; then
-            echo "::error::O script das casas não terminou como esperado"; exit 1
-          fi
-          N=$(echo "$RES" | sed -E 's/.*melhoradas: ([0-9]+) de ([0-9]+).*/\1/')
-          M=$(echo "$RES" | sed -E 's/.*melhoradas: ([0-9]+) de ([0-9]+).*/\2/')
-          if [ "$M" -eq 0 ] || [ "$N" -ne "$M" ]; then
-            echo "::error::Blender melhorou só $N de $M casas. Veja o log acima."; exit 1
-          fi
-          echo "- Casas melhoradas pelo Blender: $N de $M" >> "$GITHUB_STEP_SUMMARY"
+          SCRIPT=$(find work -name make_character.py | head -n 1)
+          if [ -z "$SCRIPT" ]; then echo "::error::make_character.py não encontrado"; exit 1; fi
+          blender -b --python-exit-code 1 -noaudio -P "$SCRIPT" -- projeto_final/assets/character.glb
+          test -s projeto_final/assets/character.glb
 
-      - name: Gravar sombreamento nas casas (paralelo)
+      - name: Blender - modelar o carro e a roda
         run: |
-          shopt -s nullglob
-          files=(projeto_final/condos/*_raw.obj)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::Nenhum *_raw.obj em projeto_final/condos"; exit 1
-          fi
-          printf '%s\n' "${files[@]}" | xargs -P "$(nproc)" -I{} sh -c \
-            'raw="$1"; python "$BAKE_AO" "$raw" "${raw%_raw.obj}.obj" 1.4 0.25' _ {}
-          echo "- Casas com sombreamento gravado: ${#files[@]}" >> "$GITHUB_STEP_SUMMARY"
+          SCRIPT=$(find work -name make_car.py | head -n 1)
+          if [ -z "$SCRIPT" ]; then echo "::error::make_car.py não encontrado"; exit 1; fi
+          blender -b --python-exit-code 1 -noaudio -P "$SCRIPT" -- projeto_final/assets
+          test -s projeto_final/assets/car_body.glb
+          test -s projeto_final/assets/car_wheel.glb
 
-      - name: Gravar sombreamento da cidade (Python, base para o Cycles)
+      - name: Blender - acabamento das casas dos condomínios
         run: |
-          test -d projeto_final/city || { echo "::error::Pasta city não existe no projeto"; exit 1; }
-          python "$BAKE_CITY" projeto_final/city 220
-          LIT=$(find projeto_final/city -name 'city_solid_*_lit.obj' | wc -l)
-          if [ "$LIT" -eq 0 ]; then
-            echo "::error::bake_city.py não gerou nenhum *_lit.obj"; exit 1
-          fi
-          echo "Pedaços *_lit.obj: $LIT"
+          SCRIPT=$(find work -name enhance_houses.py | head -n 1)
+          if [ -z "$SCRIPT" ]; then echo "::error::enhance_houses.py não encontrado"; exit 1; fi
+          blender -b --python-exit-code 1 -noaudio -P "$SCRIPT" -- projeto_final/condos
 
-      - name: Blender - iluminação global da cidade com Cycles
-        timeout-minutes: 100
+      - name: Gravar o sombreamento nas casas
         run: |
-          cp "$BAKE_CITY_GI" /tmp/bake_city_gi.py
-          sed -i -E "s/^SAMPLES = [0-9]+/SAMPLES = ${CYCLES_SAMPLES}/" /tmp/bake_city_gi.py
-          grep -E '^SAMPLES = ' /tmp/bake_city_gi.py
-          LIT=$(find projeto_final/city -name 'city_solid_*_lit.obj' | wc -l)
-          "$HOME/blender/blender" -b --factory-startup -noaudio --python-exit-code 1 \
-            -P /tmp/bake_city_gi.py -- projeto_final/city 2>&1 | tee /tmp/gi.log
-          DONE=$(grep -c '^regravado:' /tmp/gi.log || true)
-          if [ "$DONE" -ne "$LIT" ]; then
-            echo "::error::Cycles regravou $DONE de $LIT pedaços da cidade. Veja o log acima."; exit 1
-          fi
-          echo "- Cidade com iluminação global (Cycles, $CYCLES_SAMPLES amostras): $DONE pedaços" >> "$GITHUB_STEP_SUMMARY"
+          BAKE=$(find work -name bake_ao.py | head -n 1)
+          if [ -z "$BAKE" ]; then echo "::error::bake_ao.py não encontrado"; exit 1; fi
+          COUNT=0
+          for raw in projeto_final/condos/*_raw.obj; do
+            out="${raw%_raw.obj}.obj"
+            python "$BAKE" "$raw" "$out" 1.4 0.25
+            COUNT=$((COUNT+1))
+          done
+          echo "casas com sombreamento: $COUNT"
+          test "$COUNT" -gt 0
 
-      - uses: actions/upload-artifact@v7
+      - name: Blender - iluminação global da cidade (Cycles)
+        timeout-minutes: 300
+        run: |
+          SCRIPT=$(find work -name bake_city_gi.py | head -n 1)
+          if [ -z "$SCRIPT" ]; then echo "::error::bake_city_gi.py não encontrado"; exit 1; fi
+          blender -b --python-exit-code 1 -noaudio -P "$SCRIPT" -- projeto_final/city
+
+      - uses: actions/upload-artifact@v4
         with:
           name: projeto
           path: projeto_final
-          retention-days: 3
 
-  # ------------------------------------------------------------------
-  # 2) Exporta o APK com Godot + Android SDK
-  # ------------------------------------------------------------------
   apk:
-    needs: preparar
+    needs: extrair
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
+    container: barichello/godot-ci:4.3
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: projeto
           path: projeto_final
 
-      - name: JDK 17
+      - name: Preparar Godot e Android
         run: |
-          JAVA="${JAVA_HOME_17_X64:-}"
-          if [ -z "$JAVA" ] || [ ! -d "$JAVA" ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq openjdk-17-jdk-headless
-            JAVA=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
+          echo "HOME=$HOME  GODOT_VERSION='$GODOT_VERSION'"
+          echo "--- procurando templates, SDK e Java ---"
+          find / -maxdepth 6 -type d -name export_templates 2>/dev/null || true
+          ls -d /usr/lib/android-sdk /usr/lib/jvm/* 2>/dev/null || true
+          echo "ANDROID_HOME='$ANDROID_HOME' ANDROID_SDK_ROOT='$ANDROID_SDK_ROOT'"
+
+          # templates de exportação (não depende da variável GODOT_VERSION)
+          SRC=$(ls -d /root/.local/share/godot/export_templates/*/ 2>/dev/null | head -n 1)
+          if [ -z "$SRC" ]; then
+            echo "::error::Templates de exportação não encontrados (veja a lista acima)"
+            exit 1
           fi
-          echo "JAVA_HOME=$JAVA" >> "$GITHUB_ENV"
-          echo "$JAVA/bin" >> "$GITHUB_PATH"
-          "$JAVA/bin/java" -version
+          NAME=$(basename "$SRC")
+          mkdir -p ~/.local/share/godot/export_templates ~/.config/godot
+          cp -r "$SRC" ~/.local/share/godot/export_templates/"$NAME"
+          echo "Templates copiados: $NAME"
 
-      - name: Android SDK (versões que o Godot pede)
-        run: |
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKM" ]; then SDKM=$(command -v sdkmanager || true); fi
-          if [ -z "$SDKM" ]; then
-            echo "::error::sdkmanager não encontrado em $SDK"; exit 1
-          fi
-          yes | sudo env "JAVA_HOME=$JAVA_HOME" "$SDKM" --sdk_root="$SDK" --licenses >/dev/null || true
-          sudo env "JAVA_HOME=$JAVA_HOME" "$SDKM" --sdk_root="$SDK" \
-            "platform-tools" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
-            "platforms;${ANDROID_PLATFORM}" \
-            "cmdline-tools;latest" \
-            "cmake;${ANDROID_CMAKE}" \
-            "ndk;${ANDROID_NDK}"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          # SDK do Android e Java
+          SDK=/usr/lib/android-sdk
+          if [ ! -d "$SDK" ]; then SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"; fi
+          JAVA=$(ls -d /usr/lib/jvm/*/ 2>/dev/null | head -n 1)
+          JAVA=${JAVA%/}
+          echo "SDK=$SDK  JAVA=$JAVA"
 
-      - name: Cache do Godot
-        id: cache-godot
-        uses: actions/cache@v6
-        with:
-          path: ~/godot-dl
-          key: godot-${{ env.GODOT_VERSION }}-linux
+          # chave de debug
+          keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+            -keystore ~/debug.keystore -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
 
-      - name: Baixar Godot e templates de exportação
-        if: steps.cache-godot.outputs.cache-hit != 'true'
-        run: |
-          case "$GODOT_VERSION" in
-            ''|*[!0-9.]*) echo "::error::Versão do Godot inválida"; exit 1;;
-          esac
-          V="$GODOT_VERSION"
-          BASE="https://github.com/godotengine/godot/releases/download/${V}-stable"
-          mkdir -p "$HOME/godot-dl"
-          curl -fL --retry 5 --retry-delay 5 "$BASE/Godot_v${V}-stable_linux.x86_64.zip" -o "$HOME/godot-dl/godot.zip"
-          curl -fL --retry 5 --retry-delay 5 "$BASE/Godot_v${V}-stable_export_templates.tpz" -o "$HOME/godot-dl/templates.tpz"
-
-      - name: Instalar Godot e templates
-        run: |
-          V="$GODOT_VERSION"
-          mkdir -p "$HOME/godot-bin" "$HOME/tpl" "$HOME/.local/share/godot/export_templates/${V}.stable"
-          unzip -oq "$HOME/godot-dl/godot.zip" -d "$HOME/godot-bin"
-          sudo install -m 0755 "$HOME/godot-bin/Godot_v${V}-stable_linux.x86_64" /usr/local/bin/godot
-          unzip -oq "$HOME/godot-dl/templates.tpz" -d "$HOME/tpl"
-          cp -r "$HOME/tpl/templates/." "$HOME/.local/share/godot/export_templates/${V}.stable/"
-          ls "$HOME/.local/share/godot/export_templates/${V}.stable" | head -n 20
-          godot --headless --version
-
-      - name: Chave de debug e configurações do Android
-        run: |
-          mkdir -p "$HOME/.config/godot"
-          keytool -genkeypair -v -keystore "$HOME/debug.keystore" -storepass android \
-            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 9999 \
-            -dname "CN=Android Debug,O=Android,C=US" -deststoretype pkcs12
-
-          MAJMIN=$(echo "$GODOT_VERSION" | cut -d. -f1-2)
-          for F in editor_settings-4.tres "editor_settings-${MAJMIN}.tres"; do
+          # configurações do editor (escritas direto, sem precisar abrir o Godot antes)
+          for F in editor_settings-4.tres editor_settings-4.3.tres; do
             {
               echo '[gd_resource type="EditorSettings" format=3]'
               echo ''
               echo '[resource]'
-              echo "export/android/android_sdk_path = \"$ANDROID_HOME\""
-              echo "export/android/java_sdk_path = \"$JAVA_HOME\""
+              echo "export/android/android_sdk_path = \"$SDK\""
+              echo "export/android/java_sdk_path = \"$JAVA\""
               echo "export/android/debug_keystore = \"$HOME/debug.keystore\""
               echo 'export/android/debug_keystore_user = "androiddebugkey"'
               echo 'export/android/debug_keystore_pass = "android"'
-            } > "$HOME/.config/godot/$F"
+            } > ~/.config/godot/$F
           done
 
-          {
-            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$HOME/debug.keystore"
-            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey"
-            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android"
-          } >> "$GITHUB_ENV"
-
-      - name: Importar recursos e exportar o APK
-        timeout-minutes: 60
+      - name: Importar recursos e exportar APK
         run: |
           mkdir -p build
           cd projeto_final
-          grep -q 'name="Android"' export_presets.cfg || {
-            echo "::error::export_presets.cfg sem o preset \"Android\""; exit 1; }
-          godot --headless --import || true
           godot --headless --import
           godot --headless --export-debug "Android" ../build/jogo.apk
-          test -s ../build/jogo.apk
-          ls -lh ../build/jogo.apk
 
-      - name: Resumo
-        run: |
-          {
-            echo "### APK gerado"
-            echo "- Godot: $GODOT_VERSION"
-            echo "- Blender: $BLENDER_VERSION (etapas obrigatórias concluídas)"
-            echo "- Tamanho: $(du -h build/jogo.apk | cut -f1)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: jogo-apk
           path: build/jogo.apk
-          retention-days: 14
           
